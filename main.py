@@ -1,5 +1,6 @@
 import os
 import asyncio
+import subprocess
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from faster_whisper import WhisperModel
@@ -17,16 +18,36 @@ PORT = int(os.getenv("PORT", 10000))
 
 app = Client("subtitle_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- WEB SERVER FOR RENDER (PORT 10000) ---
+# --- GLOBAL VARIABLES ---
+active_tasks = {} # User ke current running tasks track karne ke liye
+
+# --- WEB SERVER FOR RENDER ---
 async def web_server():
     async def handle(request):
-        return web.Response(text="Bot is running!")
+        return web.Response(text="Bot is running FAST with Skip/Refresh!")
     web_app = web.Application()
     web_app.router.add_get("/", handle)
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
+
+# --- HELPER: TASK CANCELLER ---
+def cancel_user_task(user_id):
+    if user_id in active_tasks:
+        task = active_tasks[user_id]
+        task["stop_event"].set() # Timer aur AI loop rok dega
+        
+        # FFmpeg ya yt-dlp background process ko kill karna
+        if task.get("process"):
+            try:
+                task["process"].kill()
+            except Exception:
+                pass
+                
+        del active_tasks[user_id]
+        return "Process Skipped/Cancelled ⏭️"
+    return "Koi process active nahi hai."
 
 # --- HELPER: TIMER BAR ---
 async def timer_bar(message, text, stop_event):
@@ -39,9 +60,9 @@ async def timer_bar(message, text, stop_event):
             await asyncio.sleep(2)
             count += 2
         except:
-            pass
+            break
 
-# --- HELPER: VTT & SRT GENERATORS ---
+# --- HELPER: FORMATTING ---
 def format_time(seconds):
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
@@ -51,9 +72,7 @@ def format_time(seconds):
 def generate_srt(segments, filename):
     with open(filename, "w", encoding="utf-8") as f:
         for i, segment in enumerate(segments, start=1):
-            start = format_time(segment.start)
-            end = format_time(segment.end)
-            f.write(f"{i}\n{start} --> {end}\n{segment.text.strip()}\n\n")
+            f.write(f"{i}\n{format_time(segment.start)} --> {format_time(segment.end)}\n{segment.text.strip()}\n\n")
 
 def generate_vtt(segments, filename):
     with open(filename, "w", encoding="utf-8") as f:
@@ -63,7 +82,28 @@ def generate_vtt(segments, filename):
             end = format_time(segment.end).replace(",", ".")
             f.write(f"{start} --> {end}\n{segment.text.strip()}\n\n")
 
-# --- COMMANDS ---
+# --- HELPER: AI PROCESSING (Background Thread) ---
+def process_audio(audio_path, req_format, sub_file, stop_event):
+    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    segments, info = model.transcribe(
+        audio_path, beam_size=1, vad_filter=True, 
+        vad_parameters=dict(min_silence_duration_ms=500)
+    )
+    
+    segments_list = []
+    # Agar user bich me skip dabaye toh AI ruk jaye
+    for segment in segments:
+        if stop_event.is_set():
+            return False 
+        segments_list.append(segment)
+        
+    if req_format == "vtt":
+        generate_vtt(segments_list, sub_file)
+    else:
+        generate_srt(segments_list, sub_file)
+    return True
+
+# --- COMMANDS & BUTTONS ---
 @app.on_message(filters.command("start"))
 async def start(client, message):
     await message.reply_text(
@@ -74,25 +114,50 @@ async def start(client, message):
         ])
     )
 
-@app.on_message(filters.regex(r"(?i)^#(vtt|srt|refresh|skip)"))
+# Button Clicks (Skip/Refresh Handle)
+@app.on_callback_query(filters.regex("^(skip|refresh)$"))
+async def handle_buttons(client, query):
+    user_id = query.from_user.id
+    if user_id not in [OWNER_ID, ALLOWED_USER]:
+        return await query.answer("Aap authorized nahi ho!", show_alert=True)
+        
+    msg = cancel_user_task(user_id)
+    if query.data == "refresh":
+        msg = "Bot Refreshed! 🔄 Nayi file send karein."
+    
+    await query.answer(msg, show_alert=True)
+    await query.message.reply_text(msg)
+
+# Text Commands (Skip/Refresh Handle)
+@app.on_message(filters.regex(r"(?i)^#(skip|refresh)"))
+async def handle_text_commands(client, message):
+    user_id = message.from_user.id if message.from_user else 0
+    if user_id not in [OWNER_ID, ALLOWED_USER] and message.chat.id != ALLOWED_GROUP:
+        return
+        
+    msg = cancel_user_task(user_id)
+    if "#refresh" in message.text.lower():
+        msg = "Bot Refreshed! 🔄 Nayi file send karein."
+    await message.reply_text(msg)
+
+# Main Processing (#vtt / #srt)
+@app.on_message(filters.regex(r"(?i)^#(vtt|srt)"))
 async def process_sub(client, message):
     user_id = message.from_user.id if message.from_user else 0
     chat_id = message.chat.id
     
-    # Permission Check
     if user_id not in [OWNER_ID, ALLOWED_USER] and chat_id != ALLOWED_GROUP:
         return
 
-    cmd = message.text.lower().strip()
-    
-    if cmd in ["#refresh", "#skip"]:
-        await message.reply_text("Command processing skipped/refreshed.")
+    # Ek waqt me ek hi task ho
+    if user_id in active_tasks:
+        await message.reply_text("Ek process pehle se chal raha hai. Pehle use #skip karein.")
         return
 
+    cmd = message.text.lower().strip()
     is_link = False
     link_url = ""
 
-    # Check reply to video or link
     if message.reply_to_message:
         target_msg = message.reply_to_message
         if target_msg.text and "http" in target_msg.text:
@@ -109,75 +174,80 @@ async def process_sub(client, message):
     msg = await message.reply_text("Prosesing... ⏳")
     
     stop_event = asyncio.Event()
-    timer_task = asyncio.create_task(timer_bar(msg, "Prosesing... ⏳ (Direct Audio Streaming)", stop_event))
+    active_tasks[user_id] = {"process": None, "stop_event": stop_event}
     
-    audio_path = f"audio_{message.id}.mp3"
+    audio_path = f"audio_{message.id}.wav"
     sub_file = f"output_{message.id}.{req_format}"
+
+    timer_task = asyncio.create_task(timer_bar(msg, "Prosesing... ⏳ (Fast Audio Stream)", stop_event))
 
     try:
         if is_link:
-            # yt-dlp direct link se sirf audio fetch karega, video nahi.
-            command = ["yt-dlp", "-x", "--audio-format", "mp3", "-o", audio_path, link_url]
+            command = ["yt-dlp", "-x", "--audio-format", "wav", "-o", audio_path, link_url]
             proc = await asyncio.create_subprocess_exec(*command)
+            active_tasks[user_id]["process"] = proc
             await proc.wait()
         else:
-            # Telegram Cloud se Streaming (NO VIDEO DOWNLOAD)
             command = [
-                "ffmpeg", "-y", "-i", "pipe:0",  # Input from Pipe (Stream)
-                "-vn", "-acodec", "libmp3lame", "-q:a", "2", audio_path # Only audio extract
+                "ffmpeg", "-y", "-i", "pipe:0",
+                "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path
             ]
-            
             proc = await asyncio.create_subprocess_exec(
                 *command,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL
             )
+            active_tasks[user_id]["process"] = proc
 
-            # Pyrogram stream video bytes directly to FFmpeg memory
             try:
+                # Video direct stream to ffmpeg
                 async for chunk in client.stream_media(target_msg):
+                    if stop_event.is_set():
+                        raise Exception("User Skipped")
                     proc.stdin.write(chunk)
                     await proc.stdin.drain()
-            except Exception as stream_err:
+            except Exception:
                 pass
             finally:
-                proc.stdin.close()
+                if proc.stdin: proc.stdin.close()
                 await proc.wait()
 
-        stop_event.set() # Stop first timer
+        if stop_event.is_set():
+            raise Exception("Process Cancelled by User")
+
+        # Extraction completed, start AI Generating timer
+        stop_event.set()
         await asyncio.sleep(1)
         
-        # Start second timer
         stop_event.clear()
         timer_task = asyncio.create_task(timer_bar(msg, "Genreting... ⚙️ (AI Subtitles)", stop_event))
 
-        # Faster Whisper - Gender aur Native Language perfectly detect karega (Memory safe for Render)
-        model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        segments, info = model.transcribe(audio_path, beam_size=5)
+        # AI processing ko background thread me chalana (Taaki bot aur commands sun sake)
+        success = await asyncio.to_thread(process_audio, audio_path, req_format, sub_file, stop_event)
         
-        segments_list = list(segments)
-        
-        if req_format == "vtt":
-            generate_vtt(segments_list, sub_file)
-            caption = "vtt format\nWEBVTT ✅"
-        else:
-            generate_srt(segments_list, sub_file)
-            caption = "srt format\n1\nTiming\nDialogue ✅"
+        if not success or stop_event.is_set():
+            raise Exception("AI Processing Cancelled by User")
 
         stop_event.set()
         await msg.delete()
         
-        # Output Send
+        caption = "vtt format\nWEBVTT ✅" if req_format == "vtt" else "srt format\n1\nTiming\nDialogue ✅"
         await message.reply_document(sub_file, caption=caption)
         await message.reply_text("massage 😉 ho gya naa")
 
     except Exception as e:
         stop_event.set()
-        await msg.edit_text(f"Error: {str(e)}")
+        err_msg = str(e)
+        if "Cancelled" not in err_msg and "Skipped" not in err_msg:
+            await msg.edit_text(f"Error: {err_msg}")
+        else:
+            await msg.delete()
     
     finally:
-        # Pura process khatam hone ke baad Audio aur Vtt delete (Data Clear)
+        # Pura process khatam hone par safai
+        if user_id in active_tasks:
+            del active_tasks[user_id]
         for f in [audio_path, sub_file]:
             if os.path.exists(f):
                 os.remove(f)
