@@ -20,10 +20,10 @@ PORT = int(os.getenv("PORT", 10000))
 app = Client("subtitle_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 active_tasks = {}
 
-# --- WEB SERVER (Keep Render Alive) ---
+# --- WEB SERVER ---
 async def web_server():
     async def handle(request):
-        return web.Response(text="Bot is running! Optimized for 512MB RAM.")
+        return web.Response(text="Bot is running! Optimized for Render 512MB.")
     web_app = web.Application()
     web_app.router.add_get("/", handle)
     runner = web.AppRunner(web_app)
@@ -40,10 +40,8 @@ def cancel_task(user_id):
         task = active_tasks[user_id]
         task["stop_event"].set()
         if task.get("process"):
-            try:
-                task["process"].kill()
-            except:
-                pass
+            try: task["process"].kill()
+            except: pass
         return True
     return False
 
@@ -52,66 +50,56 @@ def format_time(seconds):
     m, s = divmod(m, 60)
     return f"{int(h):02}:{int(m):02}:{s:06.3f}".replace(".", ",")
 
-# --- AI PROCESSING (Memory Efficient) ---
+# --- AI PROCESSING (SUPER OPTIMIZED) ---
 def generate_subs(audio_path, req_format, sub_file, stop_event):
     try:
-        # Load model only when needed to save RAM
-        model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        # Clear memory before loading AI model
+        gc.collect()
+        
+        # Load model with specific settings for low RAM
+        model = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=1)
         
         segments, _ = model.transcribe(
             audio_path,
             beam_size=1,
             vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=700)
+            vad_parameters=dict(min_silence_duration_ms=1000)
         )
 
         with open(sub_file, "w", encoding="utf-8") as f:
-            if req_format == "vtt":
-                f.write("WEBVTT\n\n")
-            
+            if req_format == "vtt": f.write("WEBVTT\n\n")
             for i, segment in enumerate(segments, 1):
-                if stop_event.is_set():
-                    return False
-                
-                start = format_time(segment.start)
-                end = format_time(segment.end)
+                if stop_event.is_set(): return False
+                start, end = format_time(segment.start), format_time(segment.end)
                 text = segment.text.strip()
-
+                if not text: continue
+                
                 if req_format == "srt":
                     f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
-                else:  # vtt
+                else:
                     f.write(f"{start.replace(',', '.')} --> {end.replace(',', '.')}\n{text}\n\n")
         
         del model
         gc.collect()
         return True
     except Exception as e:
-        print(f"Whisper Error: {e}")
+        print(f"AI Error: {e}")
         return False
 
 # --- COMMANDS ---
 @app.on_message(filters.command("start"))
 async def start(client, message):
     if not check_auth(message): return
-    await message.reply_text(
-        "👋 **Welcome Friend!**\n\n"
-        "Reply to a **Video file** or **Link** with:\n"
-        "`/srt` - Get SRT file\n"
-        "`/vtt` - Get VTT file\n\n"
-        "**Extra:**\n"
-        "`/skip` - Stop current process\n"
-        "`/refresh` - Clear bot memory"
-    )
+    await message.reply_text("🤖 **Bot Ready!**\nReply to Video/Link with /srt or /vtt")
 
 @app.on_message(filters.command(["skip", "refresh"]))
 async def clean(client, message):
     if not check_auth(message): return
     user_id = message.from_user.id
-    if cancel_task(user_id):
-        await message.reply_text("✅ Stopped and Cleared!")
-    else:
-        await message.reply_text("No active task.")
+    cancel_task(user_id)
+    if user_id in active_tasks: del active_tasks[user_id]
     gc.collect()
+    await message.reply_text("🧹 Process stopped and memory cleaned.")
 
 @app.on_message(filters.command(["srt", "vtt"]))
 async def process(client, message):
@@ -120,77 +108,63 @@ async def process(client, message):
     cmd = message.command[0].lower()
     
     target = message.reply_to_message
-    if not target:
-        return await message.reply_text("❌ Reply to a video or link!")
+    if not target: return await message.reply_text("❌ Reply to a video or link!")
 
     is_link = bool(target.text and "http" in target.text.lower())
-    
-    if user_id in active_tasks:
-        return await message.reply_text("⚠️ Task already running. Use /skip first.")
+    if user_id in active_tasks: return await message.reply_text("⚠️ Task running. Use /skip")
 
     stop_event = asyncio.Event()
     active_tasks[user_id] = {"stop_event": stop_event, "process": None}
-
     audio_path = f"audio_{user_id}.wav"
     sub_file = f"sub_{user_id}.{cmd}"
     
-    status = await message.reply_text("⏳ Extracting audio... (Direct Stream)")
+    status = await message.reply_text("⏳ **Step 1:** Extracting Audio...")
 
     try:
         if is_link:
-            # Direct Audio Extraction from Link
-            proc_cmd = [
-                "yt-dlp", "-x", "--audio-format", "wav", 
-                "--audio-quality", "0", "--no-playlist",
-                "-o", audio_path, target.text
-            ]
+            # yt-dlp extraction
+            proc_cmd = ["yt-dlp", "-x", "--audio-format", "wav", "-o", audio_path, target.text]
             proc = await asyncio.create_subprocess_exec(*proc_cmd)
             active_tasks[user_id]["process"] = proc
             await proc.wait()
         else:
-            # Direct Audio Extraction from Telegram Video Pipe
+            # FFmpeg Stream
             ffmpeg_cmd = [
-                "ffmpeg", "-y", "-probesize", "50M", "-analyzeduration", "30M",
+                "ffmpeg", "-y", "-probesize", "32M", "-analyzeduration", "20M",
                 "-i", "pipe:0", "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", audio_path
             ]
             proc = await asyncio.create_subprocess_exec(
-                *ffmpeg_cmd, stdin=asyncio.subprocess.PIPE, 
+                *ffmpeg_cmd, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
             )
             active_tasks[user_id]["process"] = proc
+            
+            async for chunk in client.stream_media(target, chunk_size=256*1024):
+                if stop_event.is_set(): break
+                proc.stdin.write(chunk)
+                await proc.stdin.drain()
+            
+            proc.stdin.close()
+            await proc.wait()
 
-            try:
-                async for chunk in client.stream_media(target, chunk_size=512*1024):
-                    if stop_event.is_set(): break
-                    if proc.stdin:
-                        proc.stdin.write(chunk)
-                        await proc.stdin.drain()
-            except:
-                pass
-            finally:
-                if proc.stdin: proc.stdin.close()
-                await proc.wait()
+        # Check if audio file exists and is not empty
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 1000:
+            raise Exception("Audio extraction failed (Empty File)")
 
         if stop_event.is_set(): raise Exception("Cancelled")
 
-        await status.edit_text("🤖 Generating Subtitles (AI)...")
-        
-        # Run AI in background thread
+        await status.edit_text("🤖 **Step 2:** AI Generating Subtitles...")
         success = await asyncio.to_thread(generate_subs, audio_path, cmd, sub_file, stop_event)
 
         if success and not stop_event.is_set():
-            await message.reply_document(sub_file, caption=f"✅ {cmd.upper()} Subtitles Generated.")
+            await message.reply_document(sub_file, caption=f"✅ Done! Format: {cmd.upper()}")
             await status.delete()
         else:
-            await status.edit_text("❌ Failed or Skipped.")
+            raise Exception("AI Processing Failed")
 
     except Exception as e:
-        if "Cancelled" in str(e):
-            await message.reply_text("⏭️ Process Skipped!")
-        else:
-            await status.edit_text(f"❌ Error: {str(e)[:200]}")
+        await status.edit_text(f"❌ **Error:** {str(e)}")
     finally:
-        # Final Cleanup
         for f in [audio_path, sub_file]:
             if os.path.exists(f): os.remove(f)
         if user_id in active_tasks: del active_tasks[user_id]
