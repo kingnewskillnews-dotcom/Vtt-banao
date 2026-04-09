@@ -1,5 +1,5 @@
 pyrogram
 tgcrypto
 faster-whisper
-yt-dlp
 aiohttp
+yt-dlp
