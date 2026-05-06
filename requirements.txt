@@ -1,5 +1,7 @@
 pyrogram
 tgcrypto
+requests
 faster-whisper
-aiohttp
-yt-dlp
+pysubs2
+deep-translator
+unidecode
